@@ -1,0 +1,377 @@
+import numpy as np
+import cv2
+from collections import deque
+
+from utils import bbox_center_xyxy, adaptive_process_noise
+from config import VEL_DAMP, R_YOLO, R_BLOB, Q_SCALE, MOTION_WINDOW
+
+
+class KalmanTrack:
+    """
+    Scale-aware Kalman tracker.
+
+    State:
+        [cx, cy, vx, vy, w, h, vw, vh]^T
+
+    Measurement:
+        [cx, cy, w, h]^T
+    """
+
+    def __init__(self, track_id, bbox_xyxy, cls_id, conf, frame_idx):
+        self.id = int(track_id)
+        self.cls_id = int(cls_id)
+        self.conf = float(conf)
+
+        x1, y1, x2, y2 = map(float, bbox_xyxy)
+        w = max(2.0, x2 - x1)
+        h = max(2.0, y2 - y1)
+        cx, cy = bbox_center_xyxy(bbox_xyxy)
+
+        self.vx_f = 0.0
+        self.vy_f = 0.0
+
+        self.prev_meas = (cx, cy)
+
+        self.hits = 1
+        self.misses = 0
+        self.yolo_misses = 0
+        self.pred_only_streak = 0
+        self.last_seen = int(frame_idx)
+
+        self.kf = cv2.KalmanFilter(8, 4)
+        dt = 1.0
+
+        self.kf.transitionMatrix = np.array([
+            [1, 0, dt, 0,  0,  0,  0,  0],
+            [0, 1, 0, dt,  0,  0,  0,  0],
+            [0, 0, 1,  0,  0,  0,  0,  0],
+            [0, 0, 0,  1,  0,  0,  0,  0],
+            [0, 0, 0,  0,  1,  0, dt,  0],
+            [0, 0, 0,  0,  0,  1,  0, dt],
+            [0, 0, 0,  0,  0,  0,  1,  0],
+            [0, 0, 0,  0,  0,  0,  0,  1],
+        ], dtype=np.float32)
+
+        self.kf.measurementMatrix = np.array([
+            [1, 0, 0, 0, 0, 0, 0, 0],  # cx
+            [0, 1, 0, 0, 0, 0, 0, 0],  # cy
+            [0, 0, 0, 0, 1, 0, 0, 0],  # w
+            [0, 0, 0, 0, 0, 1, 0, 0],  # h
+        ], dtype=np.float32)
+
+        self.kf.errorCovPost = np.eye(8, dtype=np.float32)
+
+        self.kf.measurementNoiseCov = np.diag([
+            R_YOLO, R_YOLO,
+            12.0, 12.0
+        ]).astype(np.float32)
+
+        q = Q_SCALE * adaptive_process_noise(h)
+        Q = np.eye(8, dtype=np.float32) * q
+        Q[2, 2] *= 0.15
+        Q[3, 3] *= 0.15
+        Q[6, 6] *= 0.25
+        Q[7, 7] *= 0.25
+        Q[4, 4] *= 0.20
+        Q[5, 5] *= 0.20
+        self.kf.processNoiseCov = Q
+
+        self.kf.statePost = np.array([
+            [cx], [cy], [0.0], [0.0],
+            [w],  [h],  [0.0], [0.0]
+        ], dtype=np.float32)
+
+        self.last_pred = np.array([cx, cy], dtype=np.float32)
+
+        self.center_history = deque(maxlen=MOTION_WINDOW)
+        self.vec_history = deque(maxlen=MOTION_WINDOW)
+        self.speed_history = deque(maxlen=MOTION_WINDOW)
+        self.angle_history = deque(maxlen=MOTION_WINDOW)
+
+        self.anomaly_count = 0
+        self.is_anomaly = False
+        self.anomaly_reason = ""
+
+    @property
+    def w(self):
+        return float(max(2.0, self.kf.statePost[4, 0]))
+
+    @w.setter
+    def w(self, value):
+        self.kf.statePost[4, 0] = float(max(2.0, value))
+
+    @property
+    def h(self):
+        return float(max(2.0, self.kf.statePost[5, 0]))
+
+    @h.setter
+    def h(self, value):
+        self.kf.statePost[5, 0] = float(max(2.0, value))
+
+    def _smooth_velocity(self):
+        vx = float(self.kf.statePost[2, 0])
+        vy = float(self.kf.statePost[3, 0])
+        beta = 0.12
+        self.vx_f = (1.0 - beta) * self.vx_f + beta * vx
+        self.vy_f = (1.0 - beta) * self.vy_f + beta * vy
+
+    def _clamp_size_state(self):
+        self.kf.statePost[4, 0] = max(2.0, float(self.kf.statePost[4, 0]))
+        self.kf.statePost[5, 0] = max(2.0, float(self.kf.statePost[5, 0]))
+        self.kf.statePost[6, 0] = float(np.clip(self.kf.statePost[6, 0], -80.0, 80.0))
+        self.kf.statePost[7, 0] = float(np.clip(self.kf.statePost[7, 0], -80.0, 80.0))
+
+    def predict_only(self):
+        pred = self.kf.predict()
+
+        self.kf.statePost[2, 0] *= VEL_DAMP
+        self.kf.statePost[3, 0] *= VEL_DAMP
+        self.kf.statePost[6, 0] *= 0.92
+        self.kf.statePost[7, 0] *= 0.92
+
+        self._clamp_size_state()
+
+        px = float(pred[0, 0])
+        py = float(pred[1, 0])
+        self.last_pred = np.array([px, py], dtype=np.float32)
+        return px, py
+
+    def correct_center(self, cx, cy, frame_idx, conf=0.0):
+        old_R = self.kf.measurementNoiseCov.copy()
+        self.kf.measurementNoiseCov = np.diag([
+            R_BLOB, R_BLOB,
+            1e6, 1e6
+        ]).astype(np.float32)
+
+        meas = np.array([
+            [float(cx)],
+            [float(cy)],
+            [float(self.w)],
+            [float(self.h)],
+        ], dtype=np.float32)
+
+        self.kf.correct(meas)
+        self.kf.measurementNoiseCov = old_R
+
+        self._clamp_size_state()
+
+        self.prev_meas = (cx, cy)
+        self.last_pred = np.array([
+            float(self.kf.statePost[0, 0]),
+            float(self.kf.statePost[1, 0])
+        ], dtype=np.float32)
+        self.last_seen = int(frame_idx)
+        self.conf = float(conf)
+        self.pred_only_streak = 0
+        self._smooth_velocity()
+
+    def update(self, bbox_xyxy, conf, frame_idx, update_size=True):
+        x1, y1, x2, y2 = map(float, bbox_xyxy)
+        w_det = max(2.0, x2 - x1)
+        h_det = max(2.0, y2 - y1)
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+
+        old_R = self.kf.measurementNoiseCov.copy()
+
+        if update_size and conf >= 0.20:
+            size_noise = 6.0 if (h_det > 180 or w_det > 220) else 12.0
+            self.kf.measurementNoiseCov = np.diag([
+                R_YOLO, R_YOLO,
+                size_noise, size_noise
+            ]).astype(np.float32)
+
+            meas = np.array([
+                [float(cx)],
+                [float(cy)],
+                [float(w_det)],
+                [float(h_det)],
+            ], dtype=np.float32)
+        else:
+            self.kf.measurementNoiseCov = np.diag([
+                R_YOLO, R_YOLO,
+                1e6, 1e6
+            ]).astype(np.float32)
+
+            meas = np.array([
+                [float(cx)],
+                [float(cy)],
+                [float(self.w)],
+                [float(self.h)],
+            ], dtype=np.float32)
+
+        self.kf.correct(meas)
+        self.kf.measurementNoiseCov = old_R
+
+        self._clamp_size_state()
+
+        self.prev_meas = (cx, cy)
+        self.last_pred = np.array([
+            float(self.kf.statePost[0, 0]),
+            float(self.kf.statePost[1, 0])
+        ], dtype=np.float32)
+        self.conf = float(conf)
+        self.last_seen = int(frame_idx)
+        self.hits += 1
+        self.misses = 0
+        self.yolo_misses = 0
+        self.pred_only_streak = 0
+        self._smooth_velocity()
+
+    def mark_pred_only(self):
+        self.pred_only_streak += 1
+
+    def mark_yolo_missed(self):
+        self.yolo_misses += 1
+        self.pred_only_streak += 1
+
+    def draw_point(self):
+        return float(self.last_pred[0]), float(self.last_pred[1])
+
+    def bbox_from_center(self, cx, cy):
+        w = self.w
+        h = self.h
+        x1 = cx - w / 2.0
+        x2 = cx + w / 2.0
+        y1 = cy - h / 2.0
+        y2 = cy + h / 2.0
+        return np.array([x1, y1, x2, y2], dtype=np.float32)
+
+    def future_path(self, n_steps=25, dt=1.0):
+        cx = float(self.kf.statePost[0, 0])
+        cy = float(self.kf.statePost[1, 0])
+        vx = float(self.vx_f)
+        vy = float(self.vy_f)
+
+        pts = []
+        for k in range(1, int(n_steps) + 1):
+            pts.append((int(cx + vx * dt * k), int(cy + vy * dt * k)))
+        return pts
+
+    def update_motion_history(self, cx, cy):
+        cx = float(cx)
+        cy = float(cy)
+
+        if len(self.center_history) > 0:
+            px, py = self.center_history[-1]
+            vx = cx - px
+            vy = cy - py
+            sp = float(np.hypot(vx, vy))
+
+            self.vec_history.append((vx, vy))
+            self.speed_history.append(sp)
+
+            if sp > 1e-6:
+                ang = float(np.degrees(np.arctan2(vy, vx)))
+                self.angle_history.append(ang)
+
+        self.center_history.append((cx, cy))
+
+    def mean_motion_vector(self, n_recent=None):
+        if len(self.vec_history) == 0:
+            return np.array([0.0, 0.0], dtype=np.float32)
+
+        if n_recent is None or n_recent <= 0 or n_recent >= len(self.vec_history):
+            arr = np.array(self.vec_history, dtype=np.float32)
+        else:
+            arr = np.array(list(self.vec_history)[-n_recent:], dtype=np.float32)
+
+        return arr.mean(axis=0)
+
+    def mean_speed(self, n_recent=None):
+        if len(self.speed_history) == 0:
+            return 0.0
+
+        if n_recent is None or n_recent <= 0 or n_recent >= len(self.speed_history):
+            arr = np.array(self.speed_history, dtype=np.float32)
+        else:
+            arr = np.array(list(self.speed_history)[-n_recent:], dtype=np.float32)
+
+        return float(np.mean(arr))
+
+    def motion_samples(self):
+        return len(self.vec_history)
+
+    def check_lane_flow_anomaly(
+        self,
+        local_majority_vec=None,
+        min_samples=8,
+        dir_cos_thr=0.75,
+        min_flow_speed=0.75,
+        persist_frames=4,
+        recent_window=4,
+    ):
+        """
+        Local majority-flow anomaly:
+        - compare the track's recent instantaneous motion direction
+          against the dominant local neighborhood motion vector
+        - anomaly is triggered only by directional disagreement
+        - robust for lane-wise structured traffic scenes
+
+        No global scene-flow speed logic is used.
+        """
+
+        current_speed = float(self.speed_history[-1]) if len(self.speed_history) > 0 else 0.0
+
+        default_ret = {
+            "is_anomaly": False,
+            "reason": "",
+            "current_speed": current_speed,
+            "cos_to_local": 1.0,
+            "angle_to_local_deg": 0.0,
+            "direction_deviation": False,
+            "local_majority_mag": 0.0,
+        }
+
+        if local_majority_vec is None or len(self.vec_history) < min_samples:
+            self.anomaly_count = 0
+            self.is_anomaly = False
+            self.anomaly_reason = ""
+            return default_ret
+
+        v = self.mean_motion_vector(n_recent=recent_window).astype(np.float32)
+        vn = float(np.linalg.norm(v))
+        if vn < min_flow_speed:
+            self.anomaly_count = 0
+            self.is_anomaly = False
+            self.anomaly_reason = ""
+            return default_ret
+
+        local_majority_vec = np.asarray(local_majority_vec, dtype=np.float32)
+        local_n = float(np.linalg.norm(local_majority_vec))
+        if local_n < min_flow_speed:
+            self.anomaly_count = 0
+            self.is_anomaly = False
+            self.anomaly_reason = ""
+            return default_ret
+
+        vu = v / (vn + 1e-6)
+        lu = local_majority_vec / (local_n + 1e-6)
+
+        cos_sim = float(np.dot(vu, lu))
+        cos_sim = float(np.clip(cos_sim, -1.0, 1.0))
+        angle_deg = float(np.degrees(np.arccos(cos_sim)))
+
+        direction_deviation = bool(cos_sim < dir_cos_thr)
+
+        if direction_deviation:
+            self.anomaly_count += 1
+        else:
+            self.anomaly_count = max(0, self.anomaly_count - 1)
+
+        self.is_anomaly = bool(self.anomaly_count >= persist_frames)
+
+        if self.is_anomaly:
+            self.anomaly_reason = "local flow deviation"
+        else:
+            self.anomaly_reason = ""
+
+        return {
+            "is_anomaly": self.is_anomaly,
+            "reason": self.anomaly_reason,
+            "current_speed": current_speed,
+            "cos_to_local": cos_sim,
+            "angle_to_local_deg": angle_deg,
+            "direction_deviation": direction_deviation,
+            "local_majority_mag": local_n,
+        }

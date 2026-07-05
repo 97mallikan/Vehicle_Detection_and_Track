@@ -1,0 +1,817 @@
+import argparse
+import math
+import re
+import time
+
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+from config import *
+from utils import clamp_bbox_xyxy, bbox_area_xyxy
+from polygon import PolygonZone
+from kalman_track import KalmanTrack
+from road_direction import RoadDirectionEstimator
+from association import assoc_by_center_distance_roadaware
+from blobs import extract_blobs, assoc_tracks_to_blobs_strict
+from fg_cuda import CudaFgPipeline
+from cuda_backend import CudaMotionBackend
+from stabilizer_cuda import FrameStabilizerCUDA
+
+
+FLOW_MIN_MAG = 0.35
+FLOW_ANGLE_THR_DEG = 35.0
+FLOW_MAG_RATIO_LOW = 0.35
+FLOW_POINT_DRAW_SCALE = 3.0
+BBOX_FLOW_EXPAND_SCALE = 1.5
+BBOX_FLOW_MIN_MAG = 0.35
+
+
+def open_video_source(src: str):
+    src = src.strip()
+    if src.isdigit():
+        cap = cv2.VideoCapture(int(src))
+    elif src.startswith("/dev/video"):
+        m = re.search(r"/dev/video(\d+)", src)
+        if not m:
+            raise ValueError(f"Invalid device path: {src}")
+        cap = cv2.VideoCapture(int(m.group(1)))
+    else:
+        cap = cv2.VideoCapture(src)
+
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video source: {src}")
+
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
+
+    return cap
+
+
+def has_cuda():
+    return hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0
+
+
+def motion_score(fgmask, bbox_xyxy):
+    h, w = fgmask.shape[:2]
+    x1, y1, x2, y2 = bbox_xyxy.astype(int)
+    x1 = int(np.clip(x1, 0, w - 1))
+    x2 = int(np.clip(x2, 0, w - 1))
+    y1 = int(np.clip(y1, 0, h - 1))
+    y2 = int(np.clip(y2, 0, h - 1))
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    roi = fgmask[y1:y2, x1:x2]
+    return float((roi > 0).mean())
+
+
+def too_close_to_existing(det_bbox, tracks, iou_thr=0.15, dist_thr_factor=0.9):
+    from utils import bbox_center_xyxy, iou_xyxy
+
+    dcx, dcy = bbox_center_xyxy(det_bbox)
+
+    for t in tracks:
+        active = (t.hits >= MIN_HITS_TO_ACTIVATE)
+        recently_alive = getattr(t, "pred_only_streak", 999) <= 10
+
+        if not active and not recently_alive:
+            continue
+
+        tcx, tcy = t.draw_point()
+        tb = t.bbox_from_center(tcx, tcy)
+
+        if iou_xyxy(det_bbox, tb) > iou_thr:
+            return True
+
+        w = max(2.0, tb[2] - tb[0])
+        h = max(2.0, tb[3] - tb[1])
+        diag = np.hypot(w, h)
+        scale = max(w, h)
+
+        if scale > 120:
+            if np.hypot(dcx - tcx, dcy - tcy) < 1.25 * scale:
+                return True
+        else:
+            if np.hypot(dcx - tcx, dcy - tcy) < dist_thr_factor * diag:
+                return True
+
+    return False
+
+
+def find_recoverable_track(det_bbox, tracks, max_center_dist_factor=1.6, min_iou=0.03):
+    from utils import bbox_center_xyxy, iou_xyxy
+
+    dcx, dcy = bbox_center_xyxy(det_bbox)
+    best_idx = -1
+    best_score = -1e9
+
+    for i, t in enumerate(tracks):
+        if t.pred_only_streak <= 0:
+            continue
+
+        tcx, tcy = t.draw_point()
+        tb = t.bbox_from_center(tcx, tcy)
+
+        tw = max(2.0, tb[2] - tb[0])
+        th = max(2.0, tb[3] - tb[1])
+        diag = np.hypot(tw, th)
+
+        dist = np.hypot(dcx - tcx, dcy - tcy)
+        iou = iou_xyxy(det_bbox, tb)
+
+        if dist > max_center_dist_factor * diag and iou < min_iou:
+            continue
+
+        score = iou - 0.15 * (dist / (diag + 1e-6))
+        if score > best_score:
+            best_score = score
+            best_idx = i
+
+    return best_idx
+
+
+def draw_kernel_box(img, kernel_box, color=(0, 255, 255), thickness=1):
+    x1, y1, x2, y2 = [int(v) for v in kernel_box]
+    cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
+
+
+def velocity_to_color(vx, vy):
+    angle = math.atan2(vy, vx)
+    angle_deg = (math.degrees(angle) + 360.0) % 360.0
+
+    if 0 <= angle_deg < 60:
+        return (255, 0, 0)
+    if 60 <= angle_deg < 120:
+        return (255, 255, 0)
+    if 120 <= angle_deg < 180:
+        return (0, 255, 0)
+    if 180 <= angle_deg < 240:
+        return (0, 255, 255)
+    if 240 <= angle_deg < 300:
+        return (255, 0, 255)
+    return (0, 165, 255)
+
+
+def draw_history_from_list(vis, pts, thickness=2, min_step=1.0):
+    if len(pts) < 2:
+        return
+
+    pts_int = [(int(round(x)), int(round(y))) for (x, y) in pts]
+
+    for i in range(1, len(pts_int)):
+        x1, y1 = pts_int[i - 1]
+        x2, y2 = pts_int[i]
+
+        vx = x2 - x1
+        vy = y2 - y1
+        mag = math.sqrt(vx * vx + vy * vy)
+        if mag < min_step:
+            continue
+
+        col = velocity_to_color(vx, vy)
+        cv2.line(vis, (x1, y1), (x2, y2), col, thickness, lineType=cv2.LINE_AA)
+
+
+def draw_local_flow_points(vis, points, scale=3.0, force_red=False):
+    for p in points:
+        x0 = int(round(p["x0"]))
+        y0 = int(round(p["y0"]))
+        x1 = int(round(p["x0"] + p["vx"] * scale))
+        y1 = int(round(p["y0"] + p["vy"] * scale))
+
+        if force_red or p["anomalous"]:
+            color = (0, 0, 255)
+            thickness = 3
+            radius = 3
+        else:
+            color = velocity_to_color(p["vx"], p["vy"])
+            thickness = 2
+            radius = 2
+
+        cv2.arrowedLine(vis, (x0, y0), (x1, y1), color, thickness, line_type=cv2.LINE_AA, tipLength=0.3)
+        cv2.circle(vis, (x0, y0), radius, color, -1)
+
+
+def expand_bbox_xyxy(bbox_xyxy, scale, width, height):
+    x1, y1, x2, y2 = map(float, bbox_xyxy)
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+    w = max(2.0, x2 - x1)
+    h = max(2.0, y2 - y1)
+
+    nw = w * scale
+    nh = h * scale
+
+    nx1 = max(0, int(round(cx - 0.5 * nw)))
+    ny1 = max(0, int(round(cy - 0.5 * nh)))
+    nx2 = min(width - 1, int(round(cx + 0.5 * nw)))
+    ny2 = min(height - 1, int(round(cy + 0.5 * nh)))
+
+    return nx1, ny1, nx2, ny2
+
+
+def estimate_bbox_region_flow(flow_points, bbox_xyxy, width, height, expand_scale=1.5, min_mag=0.35):
+    rx1, ry1, rx2, ry2 = expand_bbox_xyxy(bbox_xyxy, expand_scale, width, height)
+
+    selected = []
+    for p in flow_points:
+        x0 = int(round(p["x0"]))
+        y0 = int(round(p["y0"]))
+        mag = float(p["mag"])
+
+        if mag < min_mag:
+            continue
+
+        if rx1 <= x0 <= rx2 and ry1 <= y0 <= ry2:
+            selected.append(p)
+
+    if len(selected) == 0:
+        return {
+            "valid": False,
+            "vec": np.array([0.0, 0.0], dtype=np.float32),
+            "unit": None,
+            "support": 0,
+            "mean_mag": 0.0,
+            "region_box": (rx1, ry1, rx2, ry2),
+        }
+
+    acc = np.array([0.0, 0.0], dtype=np.float32)
+    mag_sum = 0.0
+
+    for p in selected:
+        vx = float(p["vx"])
+        vy = float(p["vy"])
+        mag = float(p["mag"])
+        if mag < 1e-6:
+            continue
+
+        unit = np.array([vx, vy], dtype=np.float32) / (mag + 1e-6)
+        weight = mag
+        acc += (weight * unit).astype(np.float32)
+        mag_sum += mag
+
+    acc_norm = float(np.linalg.norm(acc))
+    if acc_norm < 1e-6:
+        return {
+            "valid": False,
+            "vec": np.array([0.0, 0.0], dtype=np.float32),
+            "unit": None,
+            "support": len(selected),
+            "mean_mag": 0.0,
+            "region_box": (rx1, ry1, rx2, ry2),
+        }
+
+    unit = acc / (acc_norm + 1e-6)
+    mean_mag = float(mag_sum / max(1, len(selected)))
+
+    return {
+        "valid": True,
+        "vec": acc,
+        "unit": unit.astype(np.float32),
+        "support": len(selected),
+        "mean_mag": mean_mag,
+        "region_box": (rx1, ry1, rx2, ry2),
+    }
+
+
+def draw_bbox_region_flow_arrow(vis, cx, cy, unit_vec, support, mean_mag, color=(0, 0, 255), scale=140.0):
+    if unit_vec is None:
+        return
+
+    x0 = int(round(cx))
+    y0 = int(round(cy))
+    x1 = int(round(cx + unit_vec[0] * scale))
+    y1 = int(round(cy + unit_vec[1] * scale))
+
+    cv2.circle(vis, (x0, y0), 6, (255, 255, 255), -1)
+    cv2.arrowedLine(vis, (x0, y0), (x1, y1), color, 5, line_type=cv2.LINE_AA, tipLength=0.35)
+
+    cv2.putText(
+        vis,
+        f"B:{support} M:{mean_mag:.2f}",
+        (x0 + 8, y0 + 22),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        2,
+    )
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--video", type=str, default=INPUT_VIDEO)
+    parser.add_argument("--weights", type=str, default=YOLO_MODEL)
+    parser.add_argument("--device", type=str, default=DEVICE)
+    parser.add_argument("--imgsz", type=int, default=1280)
+    parser.add_argument("--conf", type=float, default=0.25)
+    parser.add_argument("--stride", type=int, default=YOLO_STRIDE)
+    parser.add_argument("--poly", type=int, default=4)
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    zone = PolygonZone()
+    print(f"Polygon points: {int(args.poly)}")
+
+    use_cuda = USE_OPENCV_CUDA and has_cuda()
+    stream = cv2.cuda_Stream() if use_cuda else None
+
+    stabilizer = FrameStabilizerCUDA()
+    road_dir = RoadDirectionEstimator(ema=0.92, min_speed=0.8)
+
+    model = YOLO(args.weights)
+    model.to(args.device)
+
+    base_learn_rate = 0.0015
+    learn_rate = base_learn_rate
+    prev_fg_fraction = 0.0
+
+    cuda_fg = CudaFgPipeline()
+    morph_kernel = np.ones((3, 3), np.uint8)
+
+    fgbg = None
+    backend = None
+    backend_ready = False
+
+    tracks = []
+    next_id = 0
+    track_flow_history = {}
+
+    cv2.namedWindow("Video")
+    cv2.setMouseCallback(
+        "Video",
+        lambda e, x, y, f, p: zone.mouse_cb(e, x, y, f, int(args.poly)),
+        int(args.poly),
+    )
+
+    cap = open_video_source(args.video)
+    frame_idx = 0
+
+    ret0, first_frame = cap.read()
+    if not ret0:
+        raise RuntimeError(f"Could not read first frame from source: {args.video}")
+
+    first_frame, _, _ = stabilizer.stabilize(first_frame, stream=stream)
+    h0, w0 = first_frame.shape[:2]
+
+    if USE_CUSTOM_CUDA_BACKEND:
+        try:
+            backend = CudaMotionBackend(CUDA_BACKEND_LIB, w0, h0)
+            backend_ready = True
+            print(f"[INFO] Custom CUDA backend enabled: {CUDA_BACKEND_LIB}")
+        except Exception as e:
+            print(f"[WARN] Custom CUDA backend init failed, falling back to Python path: {e}")
+            backend_ready = False
+
+    if not backend_ready:
+        fgbg = cv2.createBackgroundSubtractorKNN(
+            history=1200,
+            dist2Threshold=900.0,
+            detectShadows=False,
+        )
+
+    pending_frame = first_frame
+
+    while True:
+        start = time.perf_counter()
+
+        if pending_frame is not None:
+            frame = pending_frame
+            pending_frame = None
+            ret = True
+        else:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+        frame, _, stab_ok = stabilizer.stabilize(frame, stream=stream)
+        if not stab_ok:
+            learn_rate = 0.0
+
+        frame_idx += 1
+        h, w = frame.shape[:2]
+
+        adaptive_lr = base_learn_rate
+        if prev_fg_fraction > 0.18:
+            adaptive_lr = 0.0
+        elif prev_fg_fraction > 0.10:
+            adaptive_lr = min(base_learn_rate, 0.0005)
+        learn_rate = adaptive_lr
+
+        backend_blobs = None
+        if backend_ready:
+            fgmask, backend_blobs = backend.process(
+                frame,
+                learning_rate=learn_rate,
+                min_area=CUDA_BACKEND_MIN_AREA,
+            )
+        else:
+            knn_frame = cv2.GaussianBlur(frame, (5, 5), 0)
+            fgmask = fgbg.apply(knn_frame, learningRate=learn_rate)
+            if use_cuda:
+                fgmask = cuda_fg.process(fgmask, stream=stream)
+            else:
+                fgmask = cv2.threshold(fgmask, 200, 255, cv2.THRESH_BINARY)[1]
+                fgmask = cv2.erode(fgmask, np.ones((3, 3), np.uint8), iterations=1)
+                fgmask = cv2.dilate(fgmask, np.ones((5, 5), np.uint8), iterations=1)
+                fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_OPEN, morph_kernel)
+                fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_CLOSE, morph_kernel)
+                fgmask = cv2.medianBlur(fgmask, 5)
+
+        prev_fg_fraction = float((fgmask > 0).mean())
+
+        large_object_present = False
+        for t in tracks:
+            cx, cy = t.draw_point()
+            tb = t.bbox_from_center(cx, cy)
+            th = max(0.0, tb[3] - tb[1])
+            tw = max(0.0, tb[2] - tb[0])
+            if th > 180 or tw > 220:
+                large_object_present = True
+                break
+
+        run_yolo = (
+            frame_idx <= WARMUP_FRAMES
+            or (frame_idx % args.stride == 0)
+            or large_object_present
+        )
+
+        tracks_pred_xy = []
+        for ti, t in enumerate(tracks):
+            px, py = t.predict_only()
+            tracks_pred_xy.append((ti, (px, py)))
+
+        _ = road_dir.update(tracks, min_hits=MIN_HITS_TO_ACTIVATE)
+
+        dets = []
+        raw_yolo = 0
+        did_yolo_update = False
+
+        if run_yolo:
+            half = args.device.startswith("cuda") and has_cuda()
+            res = model.predict(
+                frame,
+                conf=args.conf,
+                imgsz=args.imgsz,
+                device=args.device,
+                half=half,
+                verbose=False,
+            )[0]
+
+            if res.boxes is not None and len(res.boxes) > 0:
+                xyxy = res.boxes.xyxy.cpu().numpy()
+                confs = res.boxes.conf.cpu().numpy()
+                clss = res.boxes.cls.cpu().numpy()
+                raw_yolo = len(xyxy)
+
+                for b, c, k in zip(xyxy, confs, clss):
+                    b = clamp_bbox_xyxy(b, w, h)
+                    area = bbox_area_xyxy(b)
+                    ms = motion_score(fgmask, b)
+                    dets.append((b, int(k), float(c), float(ms), float(area)))
+
+            if dets and tracks_pred_xy:
+                matches, um_tracks, um_dets = assoc_by_center_distance_roadaware(
+                    tracks_pred_xy,
+                    dets,
+                    tracks,
+                    None,
+                    base=BASE_GATE,
+                    k=K_GATE,
+                    max_gate=MAX_GATE,
+                    conf_min=args.conf,
+                    min_area=MIN_BOX_AREA * 0.7,
+                )
+
+                for pti, di in matches:
+                    track_index = tracks_pred_xy[pti][0]
+                    t = tracks[track_index]
+                    b, cls_id, conf, _, _ = dets[di]
+                    t.update(b, conf, frame_idx, update_size=True)
+                    t.cls_id = cls_id
+
+                for pti in um_tracks:
+                    tracks[tracks_pred_xy[pti][0]].mark_yolo_missed()
+
+                for di in um_dets:
+                    b, cls_id, conf, ms, area = dets[di]
+
+                    if conf < SPAWN_CONF_THR or area < MIN_BOX_AREA:
+                        continue
+                    if ms < SPAWN_MOTION_THR and conf < HIGH_CONF:
+                        continue
+
+                    rescue_idx = find_recoverable_track(b, tracks)
+                    if rescue_idx >= 0:
+                        t = tracks[rescue_idx]
+                        t.update(b, conf, frame_idx, update_size=True)
+                        t.cls_id = cls_id
+                        t.yolo_misses = 0
+                        t.pred_only_streak = 0
+                        continue
+
+                    if too_close_to_existing(b, tracks, iou_thr=0.10, dist_thr_factor=1.2):
+                        continue
+
+                    tracks.append(KalmanTrack(next_id, b, cls_id, conf, frame_idx))
+                    next_id += 1
+
+                did_yolo_update = True
+
+            elif dets and not tracks_pred_xy:
+                for b, cls_id, conf, ms, area in dets:
+                    if conf < SPAWN_CONF_THR or area < MIN_BOX_AREA or ms < SPAWN_MOTION_THR:
+                        continue
+                    tracks.append(KalmanTrack(next_id, b, cls_id, conf, frame_idx))
+                    next_id += 1
+                did_yolo_update = True
+
+        if not did_yolo_update and tracks_pred_xy:
+            if backend_ready and backend_blobs is not None:
+                blobs = [
+                    {
+                        "bbox": np.array([b["x"], b["y"], b["x"] + b["w"], b["y"] + b["h"]], dtype=np.float32),
+                        "cx": float(b["cx"]),
+                        "cy": float(b["cy"]),
+                        "area": float(b["area"]),
+                    }
+                    for b in backend_blobs
+                ]
+            else:
+                blobs = extract_blobs(fgmask, min_area=800)
+
+            blob_matches = assoc_tracks_to_blobs_strict(
+                tracks_pred_xy,
+                tracks,
+                blobs,
+                w,
+                h,
+                base=BASE_GATE,
+                k=K_GATE,
+                max_gate=MAX_GATE,
+                iou_thr=0.01,
+                pad_factor=0.60,
+                area_ratio=(0.10, 12.0),
+            )
+
+            matched = set()
+            for ti, bj in blob_matches:
+                if tracks[ti].hits < MIN_HITS_TO_ACTIVATE:
+                    continue
+                b = blobs[bj]
+                tracks[ti].correct_center(b["cx"], b["cy"], frame_idx, conf=0.0)
+                matched.add(ti)
+
+            for ti, _ in tracks_pred_xy:
+                if ti not in matched:
+                    tracks[ti].mark_pred_only()
+
+        kept = []
+        for t in tracks:
+            active = (t.hits >= MIN_HITS_TO_ACTIVATE)
+            if not active:
+                if t.pred_only_streak <= TENTATIVE_MAX_MISSES:
+                    kept.append(t)
+                continue
+            if t.yolo_misses > ACTIVE_MAX_MISSES:
+                continue
+            if t.pred_only_streak > ACTIVE_PRED_ONLY_MAX:
+                continue
+            kept.append(t)
+        tracks = kept
+
+        vis = frame.copy()
+        cv2.putText(
+            vis,
+            f"YOLO:{raw_yolo} tracks:{len(tracks)} lr:{learn_rate:.4f} stride:{args.stride}",
+            (20, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2,
+        )
+
+        poly_pts_int = zone.poly_np(int(args.poly))
+        if poly_pts_int is not None:
+            overlay = vis.copy()
+            cv2.fillPoly(overlay, [poly_pts_int], (0, 255, 255))
+            cv2.addWeighted(overlay, 0.25, vis, 0.75, 0, vis)
+            cv2.polylines(vis, [poly_pts_int], True, (0, 255, 255), 2)
+
+        track_canvas = np.full_like(frame, 0)
+
+        for _, hist in track_flow_history.items():
+            draw_history_from_list(vis, hist, thickness=2, min_step=1.0)
+            draw_history_from_list(track_canvas, hist, thickness=2, min_step=1.0)
+
+        active_tracks = []
+        centers = []
+
+        for t in tracks:
+            cx, cy = t.draw_point()
+            t.update_motion_history(cx, cy)
+
+            if t.id not in track_flow_history:
+                track_flow_history[t.id] = []
+            track_flow_history[t.id].append((cx, cy))
+            if len(track_flow_history[t.id]) > 1500:
+                track_flow_history[t.id].pop(0)
+
+            active_tracks.append((t, cx, cy))
+            centers.append((int(round(cx)), int(round(cy))))
+
+        current_speeds = []
+        for t, _, _ in active_tracks:
+            if len(t.speed_history) > 0:
+                current_speeds.append((t.id, float(t.speed_history[-1])))
+
+        current_speeds.sort(key=lambda x: x[1], reverse=True)
+        fast_ids = {tid for tid, _ in current_speeds[:3]}
+
+        run_flow_every = 2
+        if backend_ready and centers and (frame_idx % run_flow_every == 0):
+            flow_results = backend.analyze_objects(
+                centers,
+                min_mag=FLOW_MIN_MAG,
+                angle_thr_deg=FLOW_ANGLE_THR_DEG,
+                mag_ratio_low=FLOW_MAG_RATIO_LOW,
+            )
+        else:
+            flow_results = []
+
+        for idx, (t, cx, cy) in enumerate(active_tracks):
+            fut = t.future_path(25)
+            entering = False
+            inside_now = False
+
+            if poly_pts_int is not None:
+                inside_now = zone.inside(cx, cy, poly_pts_int)
+                future_inside = zone.future_any_inside(fut, poly_pts_int)
+                entering = future_inside and (not inside_now)
+                if (entering or inside_now) and (t.id not in zone.violated):
+                    zone.violated.add(t.id)
+
+            active = (t.hits >= MIN_HITS_TO_ACTIVATE)
+            pred_only = (t.pred_only_streak > 0)
+
+            tb = t.bbox_from_center(cx, cy).astype(int)
+            x1, y1, x2, y2 = tb
+
+            bbox_flow = {
+                "valid": False,
+                "vec": np.array([0.0, 0.0], dtype=np.float32),
+                "unit": None,
+                "support": 0,
+                "mean_mag": 0.0,
+                "region_box": (x1, y1, x2, y2),
+            }
+
+            local_majority_vec = None
+            if idx < len(flow_results):
+                fr = flow_results[idx]
+                local_majority_vec = np.array([fr["majority_vx"], fr["majority_vy"]], dtype=np.float32)
+
+                bbox_flow = estimate_bbox_region_flow(
+                    flow_points=fr["points"],
+                    bbox_xyxy=tb,
+                    width=w,
+                    height=h,
+                    expand_scale=BBOX_FLOW_EXPAND_SCALE,
+                    min_mag=BBOX_FLOW_MIN_MAG,
+                )
+
+            anomaly_evt = t.check_lane_flow_anomaly(
+                local_majority_vec=local_majority_vec,
+                min_samples=MIN_MOTION_SAMPLES,
+                dir_cos_thr=LOCAL_FLOW_COS_ANOM_THR,
+                min_flow_speed=MIN_FLOW_SPEED,
+                persist_frames=ANOMALY_PERSIST_FRAMES,
+                recent_window=4,
+            )
+
+            if anomaly_evt["is_anomaly"]:
+                col = (0, 0, 255)
+            elif poly_pts_int is not None and (entering or inside_now):
+                col = (0, 0, 255)
+            else:
+                col = (255, 0, 0) if not active else ((0, 200, 255) if pred_only else (0, 255, 0))
+
+            cv2.rectangle(vis, (x1, y1), (x2, y2), col, 2)
+            cv2.circle(vis, (int(cx), int(cy)), 4, col, -1)
+
+            cv2.putText(
+                vis,
+                f"ID {t.id} hits {t.hits} ymiss {t.yolo_misses} streak {t.pred_only_streak}",
+                (x1, max(0, y1 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                col,
+                2,
+            )
+
+            if t.id in fast_ids:
+                cv2.putText(
+                    vis,
+                    "FAST",
+                    (x1, max(18, y1 - 30)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 255),
+                    2,
+                )
+
+            if anomaly_evt["is_anomaly"]:
+                cv2.putText(
+                    vis,
+                    f"ANOMALY: {anomaly_evt['reason']}",
+                    (x1, max(36, y1 - 52)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 0, 255),
+                    2,
+                )
+
+            cv2.putText(
+                vis,
+                f"spd:{anomaly_evt['current_speed']:.2f}",
+                (x1, min(h - 46, y2 + 18)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                1,
+            )
+
+            cv2.putText(
+                vis,
+                f"cosLocal:{anomaly_evt['cos_to_local']:.2f} ang:{anomaly_evt['angle_to_local_deg']:.1f}",
+                (x1, min(h - 28, y2 + 36)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 0),
+                1,
+            )
+
+            cv2.putText(
+                vis,
+                f"bboxFlowMag:{bbox_flow['mean_mag']:.2f} pts:{bbox_flow['support']}",
+                (x1, min(h - 10, y2 + 54)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 255),
+                1,
+            )
+
+            if bbox_flow["valid"]:
+                rx1, ry1, rx2, ry2 = bbox_flow["region_box"]
+                cv2.rectangle(vis, (rx1, ry1), (rx2, ry2), (255, 255, 255), 1)
+                draw_bbox_region_flow_arrow(
+                    vis,
+                    cx,
+                    cy,
+                    bbox_flow["unit"],
+                    bbox_flow["support"],
+                    bbox_flow["mean_mag"],
+                    color=(255, 255, 255),
+                    scale=70.0,
+                )
+
+            if idx < len(flow_results):
+                fr = flow_results[idx]
+                draw_kernel_box(vis, fr["kernel_box"], color=(0, 255, 255), thickness=1)
+                draw_local_flow_points(
+                    vis,
+                    fr["points"],
+                    scale=FLOW_POINT_DRAW_SCALE,
+                    force_red=anomaly_evt["is_anomaly"],
+                )
+
+        cv2.imshow("Video", vis)
+        cv2.imshow("Tracked Objects on White Canvas", track_canvas)
+
+        end = time.perf_counter()
+        print(f"Execution time: {end - start:.6f} seconds")
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27:
+            break
+        if key == ord("r"):
+            zone.reset()
+            print("Reset polygon + violated tracks.")
+        elif key == ord("="):
+            learn_rate = min(0.05, learn_rate * 1.5)
+        elif key == ord("-"):
+            learn_rate = max(0.0, learn_rate / 1.5)
+
+    if backend is not None:
+        backend.close()
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
