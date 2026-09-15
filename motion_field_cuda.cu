@@ -28,21 +28,9 @@
         } \
     } while (0)
 
-namespace {
-
-constexpr int KSIZE = 32;
-constexpr int BLOCK_X = 16;
-constexpr int BLOCK_Y = 16;
-constexpr int THREADS_PER_BLOCK = BLOCK_X * BLOCK_Y;
-constexpr int DEFAULT_POINT_STRIDE = 128;
-
-__constant__ float c_gauss32[KSIZE * KSIZE];
-
-struct RegionStatGPU {
-    int area;
-    int minx, miny, maxx, maxy;
-    float sumx, sumy;
-};
+// Public C API structures.
+// These must remain outside the anonymous namespace so the exported
+// extern "C" functions that use them retain global symbol visibility.
 
 struct BlobRegion {
     int label;
@@ -58,6 +46,44 @@ struct BlobRegion {
 struct TrackCenter {
     int x;
     int y;
+};
+
+struct ObjectFlowResultHost {
+    float majority_vx;
+    float majority_vy;
+    float majority_mag;
+    int valid_count;
+    int anomaly_count;
+    float anomaly_ratio;
+    int kernel_x1;
+    int kernel_y1;
+    int kernel_x2;
+    int kernel_y2;
+};
+
+struct FlowPointHost {
+    int x0;
+    int y0;
+    float vx;
+    float vy;
+    float mag;
+    int anomalous;
+};
+
+namespace {
+
+constexpr int KSIZE = 32;
+constexpr int BLOCK_X = 16;
+constexpr int BLOCK_Y = 16;
+constexpr int THREADS_PER_BLOCK = BLOCK_X * BLOCK_Y;
+constexpr int DEFAULT_POINT_STRIDE = 128;
+
+__constant__ float c_gauss32[KSIZE * KSIZE];
+
+struct RegionStatGPU {
+    int area;
+    int minx, miny, maxx, maxy;
+    float sumx, sumy;
 };
 
 struct FlowPointGpu {
@@ -83,28 +109,6 @@ struct ObjectFlowResultGpu {
     int kernel_y1;
     int kernel_x2;
     int kernel_y2;
-};
-
-struct ObjectFlowResultHost {
-    float majority_vx;
-    float majority_vy;
-    float majority_mag;
-    int valid_count;
-    int anomaly_count;
-    float anomaly_ratio;
-    int kernel_x1;
-    int kernel_y1;
-    int kernel_x2;
-    int kernel_y2;
-};
-
-struct FlowPointHost {
-    int x0;
-    int y0;
-    float vx;
-    float vy;
-    float mag;
-    int anomalous;
 };
 
 __device__ __forceinline__ int clampi(int v, int lo, int hi) {
